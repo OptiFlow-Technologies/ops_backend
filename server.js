@@ -1,21 +1,86 @@
 const express = require("express");
 const cors = require("cors");
 const dotenv = require("dotenv");
-const fs = require('fs');
 const path = require('path');
+const rateLimit = require('express-rate-limit');
 
 dotenv.config();
 
+// ======================================================
+// D6 — ENV VAR VALIDATION ON STARTUP
+// ======================================================
+const REQUIRED_ENV_VARS = [
+  'JWT_SECRET',
+  'GOOGLE_SHEET_ID',
+  'GOOGLE_SHEET_ID_CHECKLIST',
+  'GOOGLE_SERVICE_ACCOUNT_EMAIL',
+  'GOOGLE_PRIVATE_KEY',
+  'META_WA_PHONE_ID',
+  'META_WA_TOKEN',
+];
+
+const missingVars = REQUIRED_ENV_VARS.filter(v => !process.env[v]);
+if (missingVars.length > 0) {
+  console.error(JSON.stringify({
+    level: 'error',
+    time: new Date().toISOString(),
+    msg: 'Missing required environment variables — server cannot start',
+    missing: missingVars,
+  }));
+  process.exit(1);
+}
+
+const logger = require('./utils/logger');
+
 const app = express();
-app.use(cors());
+
+// ======================================================
+// S3 — CORS LOCKED TO ALLOWED ORIGINS
+// ======================================================
+const allowedOrigins = process.env.ALLOWED_ORIGINS
+  ? process.env.ALLOWED_ORIGINS.split(',').map(o => o.trim())
+  : ['http://localhost:3000', 'http://localhost:3001', 'http://localhost:5000'];
+
+app.use(cors({
+  origin: (origin, callback) => {
+    // Allow requests with no origin (server-to-server, curl, etc.)
+    if (!origin || allowedOrigins.includes(origin)) return callback(null, true);
+    callback(new Error(`CORS: origin ${origin} not allowed`));
+  },
+  credentials: true,
+}));
+
 app.use(express.json());
 
-// ======================================================
-// ✅ YEH LINE ADD KARNI HAI - Profile pictures ke liye
-// ======================================================
+// Profile pictures static files
 app.use('/uploads', express.static(path.join(__dirname, 'uploads')));
 
+// ======================================================
+// S2 — RATE LIMITING
+// ======================================================
+const apiLimiter = rateLimit({
+  windowMs: 15 * 60 * 1000,
+  max: 100,
+  standardHeaders: true,
+  legacyHeaders: false,
+  message: { error: 'Too many requests, please try again later.' },
+});
+
+const authLimiter = rateLimit({
+  windowMs: 15 * 60 * 1000,
+  max: 10,
+  standardHeaders: true,
+  legacyHeaders: false,
+  message: { error: 'Too many login attempts, please try again later.' },
+});
+
+app.use('/api/', apiLimiter);
+app.use('/api/auth/login', authLimiter);
+app.use('/api/adminauth/admin/login', authLimiter);
+
+// ======================================================
 // ROUTES
+// ======================================================
 const authRoutes = require("./routes/auth");
 const adminAuth = require("./routes/adminAuth");
 const delegationsRoutes = require("./routes/delegations");
@@ -27,7 +92,8 @@ const additionalFeature = require("./routes/additionalFeature");
 const allDashboard = require('./routes/allDashboard');
 const whatsappRoutes = require("./routes/whatsapp.js");
 
-// API prefix
+const errorHandler = require('./middleware/errorHandler');
+
 app.use("/api/auth", authRoutes);
 app.use("/api/adminauth", adminAuth);
 app.use("/api/additionalfeature", additionalFeature);
@@ -36,131 +102,115 @@ app.use("/api/support-tickets", supportTicketsRoutes);
 app.use("/api/checklist", checklistRoutes);
 app.use("/api/employee", employeeRouter);
 app.use("/api/helpTickets", helpTicketsRouter);
-app.use("/api/delegations", require("./routes/delegations"));
 app.use("/api/allDashboard", allDashboard);
 app.use("/api/whatsapp", whatsappRoutes);
 
 // ======================================================
-// TRACKING FILE FOR AUTO-GENERATE
+// B2 — TRACK AUTO-GENERATE VIA GOOGLE SHEETS (not file)
 // ======================================================
-const TRACK_FILE = path.join(__dirname, 'last-generate.txt');
+const { getSheets } = require('./googleSheetsClient');
 
-// Check if already generated for this month
-const isAlreadyGenerated = () => {
+const isAlreadyGenerated = async () => {
   try {
-    if (fs.existsSync(TRACK_FILE)) {
-      const lastMonth = fs.readFileSync(TRACK_FILE, 'utf8');
-      const today = new Date();
-      const currentMonth = `${today.getMonth() + 1}-${today.getFullYear()}`;
-      return lastMonth === currentMonth;
-    }
-  } catch (err) {
-    console.log('Track file error:', err.message);
-  }
-  return false;
-};
-
-// Mark as generated
-const markAsGenerated = () => {
-  try {
+    const sheets = await getSheets();
     const today = new Date();
-    const currentMonth = `${today.getMonth() + 1}-${today.getFullYear()}`;
-    fs.writeFileSync(TRACK_FILE, currentMonth);
-    console.log(`✅ Marked ${currentMonth} as generated`);
+    let targetMonth = today.getMonth() + 2;
+    let targetYear = today.getFullYear();
+    if (targetMonth > 12) { targetMonth = 1; targetYear++; }
+
+    const res = await sheets.spreadsheets.values.get({
+      spreadsheetId: process.env.GOOGLE_SHEET_ID_CHECKLIST,
+      range: 'GenerationLog!A2:D',
+    });
+
+    const rows = res.data.values || [];
+    return rows.some(r => String(r[0]) === String(targetMonth) && String(r[1]) === String(targetYear));
   } catch (err) {
-    console.log('Error marking as generated:', err.message);
+    // Conservative: allow generation if we can't check (duplicates prevented by endpoint)
+    logger.warn('isAlreadyGenerated check failed, assuming not generated', { err: err.message });
+    return false;
   }
 };
 
 // ======================================================
-// AUTO-GENERATE FUNCTION - RENDER FRIENDLY
+// AUTO-GENERATE FUNCTION
 // ======================================================
 const generateTasks = async () => {
-  console.log('📅 ==================================');
-  console.log(`📅 Auto-generate check at: ${new Date().toLocaleString()}`);
-  
+  logger.info('Auto-generate check running');
+
   try {
-    // Pehle check karo ki is month already generate hua ya nahi
-    if (isAlreadyGenerated()) {
-      console.log('⏭️ This month already generated, skipping');
-      console.log('📅 ==================================');
+    if (await isAlreadyGenerated()) {
+      logger.info('This month already generated, skipping');
       return;
     }
-    
-    console.log('🚀 Generating tasks...');
-    
-    // ✅ RENDER KE LIYE - BASE_URL use karo
+
+    logger.info('Generating tasks for next month');
+
     const baseUrl = process.env.BASE_URL || `http://localhost:${process.env.PORT || 3000}`;
-    
+
     const response = await fetch(`${baseUrl}/api/checklist/auto-generate-next-month`, {
       method: 'POST',
       headers: {
         'Content-Type': 'application/json',
-        'x-cron-job': 'true'  // 👈 YEH HEADER ADD KARO
-      }
+        'x-cron-job': 'true',
+      },
     });
-    
+
     const data = await response.json();
-    
+
     if (response.ok) {
-      console.log(`✅ Generated ${data.createdTasks?.length || 0} tasks`);
-      markAsGenerated();
+      logger.info('Tasks generated', { count: data.createdTasks?.length || 0 });
     } else {
-      console.log('❌ Generation failed:', data.error || 'Unknown error');
+      logger.error('Generation failed', { error: data.error || 'Unknown error' });
     }
-    
   } catch (err) {
-    console.log('❌ Error:', err.message);
+    logger.error('generateTasks error', { err: err.message });
   }
-  
-  console.log('📅 ==================================');
 };
 
 // ======================================================
-// CRON JOB - Har 1 ghante mein check
+// CRON JOB — hourly check
 // ======================================================
 const cron = require('node-cron');
 
 cron.schedule('0 * * * *', () => {
-  console.log('⏰ Hourly check running...');
+  logger.info('Hourly auto-generate check triggered');
   generateTasks();
 });
 
 // ======================================================
-// SERVER START PE CHECK
+// SERVER START
 // ======================================================
 const PORT = process.env.PORT || 3000;
 app.listen(PORT, () => {
-  console.log(`🚀 Server running on port ${PORT}`);
-  console.log('📅 Checking if generation needed on startup...');
-  
-  setTimeout(() => {
-    generateTasks();
-  }, 5000);
+  logger.info('Server started', { port: PORT });
+  setTimeout(() => { generateTasks(); }, 5000);
 });
 
 // ======================================================
-// HEALTH CHECK API
+// HEALTH CHECK
 // ======================================================
 app.get('/health', (req, res) => {
-  res.json({ 
-    status: 'ok', 
+  res.json({
+    status: 'ok',
     time: new Date().toISOString(),
-    generated: isAlreadyGenerated() ? 'yes' : 'no',
     month: new Date().getMonth() + 1,
-    year: new Date().getFullYear()
+    year: new Date().getFullYear(),
   });
 });
 
 // ======================================================
-// ADMIN MANUAL TRIGGER
+// ADMIN MANUAL TRIGGER (no auth — internal/ops use only)
 // ======================================================
 app.post('/admin/generate-now', async (req, res) => {
   try {
-    console.log('👨‍💼 Manual trigger by admin');
+    logger.info('Manual generate triggered');
     await generateTasks();
     res.json({ success: true, message: 'Generation triggered' });
   } catch (err) {
     res.status(500).json({ error: err.message });
   }
 });
+
+// R2 — Must be last middleware registered
+app.use(errorHandler);

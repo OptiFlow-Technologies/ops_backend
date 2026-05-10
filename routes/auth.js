@@ -25,6 +25,15 @@ router.post("/register", async (req, res) => {
     if (!name || !mobile || !password || !department) {
       return res.status(400).json({ error: "All fields required" });
     }
+    if (typeof password !== "string" || password.length < 6) {
+      return res.status(400).json({ error: "Password must be at least 6 characters" });
+    }
+    if (!/^\d{10}$/.test(String(mobile).trim())) {
+      return res.status(400).json({ error: "Mobile must be a 10-digit number" });
+    }
+    if (typeof name !== "string" || name.trim().length === 0 || name.length > 100) {
+      return res.status(400).json({ error: "Invalid name" });
+    }
 
     const sheets = await getSheets();
 

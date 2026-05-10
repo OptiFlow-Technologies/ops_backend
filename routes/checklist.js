@@ -2,28 +2,21 @@ const express = require("express");
 const { nanoid } = require("nanoid");
 const { getSheets } = require("../googleSheetsClient");
 const auth = require("../middleware/auth");
+const { formatIST, parseDDMMYYYY } = require("../utils/date");
+const { CHECKLIST: C } = require("../utils/columns");
 
 const router = express.Router();
 
-const MASTER_SHEET = "Master"; // SINGLE DATA SOURCE
+const MASTER_SHEET = "Master";
 
-// ======================================================
-// DATE FORMATTER → dd/mm/yyyy hh:mm:ss (IST)
-// ======================================================
-function formatDateDDMMYYYYHHMMSS(date = new Date()) {
-  // Convert to IST (UTC + 5:30)
-  const utc = date.getTime() + date.getTimezoneOffset() * 60000;
-  const istOffset = 5.5 * 60 * 60 * 1000;
-  const istDate = new Date(utc + istOffset);
-
-  const dd = String(istDate.getDate()).padStart(2, "0");
-  const mm = String(istDate.getMonth() + 1).padStart(2, "0");
-  const yyyy = istDate.getFullYear();
-  const hh = String(istDate.getHours()).padStart(2, "0");
-  const min = String(istDate.getMinutes()).padStart(2, "0");
-  const ss = String(istDate.getSeconds()).padStart(2, "0");
-
-  return `${dd}/${mm}/${yyyy} ${hh}:${min}:${ss}`;
+// B3 — Cache the numeric sheetId for Master tab (permanent; never changes)
+let _sheetTabId = null;
+async function getSheetTabId(sheets) {
+  if (_sheetTabId !== null) return _sheetTabId;
+  const meta = await sheets.spreadsheets.get({ spreadsheetId: process.env.GOOGLE_SHEET_ID_CHECKLIST });
+  const tab = meta.data.sheets.find(s => s.properties.title === MASTER_SHEET);
+  _sheetTabId = tab?.properties?.sheetId ?? 0;
+  return _sheetTabId;
 }
 
 // ======================================================
@@ -62,18 +55,17 @@ router.get("/", auth, async (req, res) => {
 
     const userName = req.user.name;
 
-    // FILTER ROWS BY USER NAME
-    const userRows = rows.filter((r) =>  r[0] === userName && (!r[7] || r[7].trim() === ""));
+    const userRows = rows.filter((r) => r[C.NAME] === userName && (!r[C.ACTUAL] || r[C.ACTUAL].trim() === ""));
 
     const data = userRows.map((r) => ({
-      Name: r[0],
-      Email: r[1],
-      Department: r[2],
-      TaskID: r[3],
-      Freq: r[4],
-      Task: r[5],
-      Planned: r[6], // deadline
-      Actual: r[7], // done date
+      Name: r[C.NAME],
+      Email: r[C.EMAIL],
+      Department: r[C.DEPT],
+      TaskID: r[C.TASK_ID],
+      Freq: r[C.FREQ],
+      Task: r[C.TASK],
+      Planned: r[C.PLANNED],
+      Actual: r[C.ACTUAL],
     }));
 
     res.json(data);
@@ -105,37 +97,37 @@ router.get("/search/by-name", auth, async (req, res) => {
 
     // If 'name' is "all", return all data (no filtering by name)
     if (name.toLowerCase() === "all") {
-      const allData = rows.map((r) => ({
-        Name: r[0],
-        Email: r[1],
-        Department: r[2],
-        TaskID: r[3],
-        Freq: r[4],
-        Task: r[5],
-        Planned: r[6],
-        Actual: r[7],
-        EmailForBuddy: r[8],
-        BuddyEmail: r[9],
-        Archive: r[10],
-      }));
-      return res.json(allData);
+      const mapRow = (r) => ({
+        Name: r[C.NAME],
+        Email: r[C.EMAIL],
+        Department: r[C.DEPT],
+        TaskID: r[C.TASK_ID],
+        Freq: r[C.FREQ],
+        Task: r[C.TASK],
+        Planned: r[C.PLANNED],
+        Actual: r[C.ACTUAL],
+        EmailForBuddy: r[C.EMAIL_BUDDY],
+        BuddyEmail: r[C.BUDDY_EMAIL],
+        Archive: r[C.ARCHIVE],
+      });
+
+      return res.json(rows.map(mapRow));
     }
 
-    // FILTER BY EXACT NAME (Case-insensitive)
     const filtered = rows
-      .filter((r) => r[0]?.toLowerCase() === name.toLowerCase()) // Filter by name
+      .filter((r) => r[C.NAME]?.toLowerCase() === name.toLowerCase())
       .map((r) => ({
-        Name: r[0],
-        Email: r[1],
-        Department: r[2],
-        TaskID: r[3],
-        Freq: r[4],
-        Task: r[5],
-        Planned: r[6],
-        Actual: r[7],
-        EmailForBuddy: r[8],
-        BuddyEmail: r[9],
-        Archive: r[10],
+        Name: r[C.NAME],
+        Email: r[C.EMAIL],
+        Department: r[C.DEPT],
+        TaskID: r[C.TASK_ID],
+        Freq: r[C.FREQ],
+        Task: r[C.TASK],
+        Planned: r[C.PLANNED],
+        Actual: r[C.ACTUAL],
+        EmailForBuddy: r[C.EMAIL_BUDDY],
+        BuddyEmail: r[C.BUDDY_EMAIL],
+        Archive: r[C.ARCHIVE],
       }));
 
     res.json(filtered);
@@ -343,19 +335,7 @@ router.patch("/done/:id", auth, async (req, res) => {
     const sheets = await getSheets();
     const spreadsheetId = process.env.GOOGLE_SHEET_ID_CHECKLIST;
 
-    // Date format function
-    function formatDateDDMMYYYYHHMMSS(date) {
-      const pad = (n) => n.toString().padStart(2, "0");
-      const day = pad(date.getDate());
-      const month = pad(date.getMonth() + 1);
-      const year = date.getFullYear();
-      const hours = pad(date.getHours());
-      const minutes = pad(date.getMinutes());
-      const seconds = pad(date.getSeconds());
-      return `${day}/${month}/${year} ${hours}:${minutes}:${seconds}`;
-    }
-
-    const currentDate = formatDateDDMMYYYYHHMMSS(new Date());
+    const currentDate = formatIST();
 
     // 1️⃣ Fetch existing rows in Consolidated sheet
     const consolidatedRes = await sheets.spreadsheets.values.get({
@@ -434,21 +414,8 @@ const nameToFilter = selectedName && selectedName.trim()
 
 // Filter rows
 let filteredRows = rows.filter(
-  (r) => r[0] && r[0].trim().toLowerCase() === nameToFilter
+  (r) => r[C.NAME] && r[C.NAME].trim().toLowerCase() === nameToFilter
 );
-
-    // -----------------------------
-    // PARSE DD/MM/YYYY
-    // -----------------------------
-    function parseDDMMYYYY(str) {
-      if (!str) return null;
-      const parts = str.split(" ")[0].split("/"); 
-      if (parts.length !== 3) return null;
-      const [d, m, y] = parts;
-      const year = y.length === 2 ? 2000 + +y : +y;
-      const date = new Date(year, +m - 1, +d);
-      return isNaN(date.getTime()) ? null : date;
-    }
 
     // -----------------------------
     // CALCULATE DATE RANGE (Monday to Sunday or Full Month)
@@ -488,13 +455,10 @@ let filteredRows = rows.filter(
     // FILTER TASKS BY CALCULATED RANGE
     // -----------------------------
     filteredRows = filteredRows.filter((task) => {
-      const plannedDate = parseDDMMYYYY(task[6]);  
-      const actualDate = parseDDMMYYYY(task[7]);   
-      
-      // Range check logic
+      const plannedDate = parseDDMMYYYY(task[C.PLANNED]);
+      const actualDate  = parseDDMMYYYY(task[C.ACTUAL]);
       const isPlannedInWeek = plannedDate && plannedDate >= weekStart && plannedDate <= weekEnd;
-      const isActualInWeek = actualDate && actualDate >= weekStart && actualDate <= weekEnd;
-
+      const isActualInWeek  = actualDate  && actualDate  >= weekStart && actualDate  <= weekEnd;
       return isPlannedInWeek || isActualInWeek;
     });
 
@@ -506,11 +470,10 @@ let filteredRows = rows.filter(
     let pendingTasks = 0;
     let onTimeTasks = 0;
     let delayedTasks = 0;
-    console.log("checklist Week Start : ", weekStart , "weekend : ", weekEnd);
 
     filteredRows.forEach((task) => {
-      const plannedDate = parseDDMMYYYY(task[6]);  
-      const actualDate = parseDDMMYYYY(task[7]);   
+      const plannedDate = parseDDMMYYYY(task[C.PLANNED]);
+      const actualDate  = parseDDMMYYYY(task[C.ACTUAL]);   
       
       // Task completed within the range
       if (actualDate && actualDate >= weekStart && actualDate <= weekEnd) {
@@ -547,15 +510,15 @@ let filteredRows = rows.filter(
       weekStart: weekStart.toLocaleDateString('en-CA'), 
       weekEnd: weekEnd.toLocaleDateString('en-CA'),
       tasks: filteredRows.map((task) => ({
-        Name: task[0],
-        Email: task[1],
-        Department: task[2],
-        TaskID: task[3],
-        Freq: task[4],
-        Task: task[5],
-        Planned: task[6],
-        Actual: task[7],
-        Status: task[7] ? "Completed" : "Pending"
+        Name: task[C.NAME],
+        Email: task[C.EMAIL],
+        Department: task[C.DEPT],
+        TaskID: task[C.TASK_ID],
+        Freq: task[C.FREQ],
+        Task: task[C.TASK],
+        Planned: task[C.PLANNED],
+        Actual: task[C.ACTUAL],
+        Status: task[C.ACTUAL] ? "Completed" : "Pending"
       }))
     });
 
@@ -602,27 +565,39 @@ router.get("/test", (req, res) => {
 
 
 // ======================================================
-// DELETE TASK
+// DELETE TASK — B3: atomic deleteDimension (no race condition)
 // ======================================================
 router.delete("/:id", auth, async (req, res) => {
   try {
     const sheets = await getSheets();
+    const spreadsheetId = process.env.GOOGLE_SHEET_ID_CHECKLIST;
 
     const fetchRes = await sheets.spreadsheets.values.get({
-      spreadsheetId: process.env.GOOGLE_SHEET_ID_CHECKLIST,
-      range: `${MASTER_SHEET}!A2:K`,
+      spreadsheetId,
+      range: `${MASTER_SHEET}!D2:D`, // Only TaskID column
     });
 
-    const rows = fetchRes.data.values || [];
-    const idx = rows.findIndex((r) => r[3] === req.params.id);
+    const ids = (fetchRes.data.values || []).map(r => r[0]);
+    const idx = ids.findIndex(id => id === req.params.id);
 
-    if (idx === -1) {
-      return res.status(404).json({ error: "Task not found" });
-    }
+    if (idx === -1) return res.status(404).json({ error: "Task not found" });
 
-    await sheets.spreadsheets.values.clear({
-      spreadsheetId: process.env.GOOGLE_SHEET_ID_CHECKLIST,
-      range: `${MASTER_SHEET}!A${idx + 2}:K${idx + 2}`,
+    const sheetTabId = await getSheetTabId(sheets);
+
+    await sheets.spreadsheets.batchUpdate({
+      spreadsheetId,
+      requestBody: {
+        requests: [{
+          deleteDimension: {
+            range: {
+              sheetId: sheetTabId,
+              dimension: "ROWS",
+              startIndex: idx + 1, // +1 for header row
+              endIndex: idx + 2,
+            },
+          },
+        }],
+      },
     });
 
     res.json({ ok: true });
@@ -665,8 +640,6 @@ router.post("/create-template", auth, async (req, res) => {
 
     const employees = empRes.data.values || [];
     const employee = employees.find(e => e[1] === employeeName);
-    console.log("employee:", employee);
-    
     
     const templateId = nanoid(8);
     

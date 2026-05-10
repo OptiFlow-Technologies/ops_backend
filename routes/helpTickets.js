@@ -3,6 +3,7 @@ const { nanoid } = require("nanoid");
 const { getSheets } = require("../googleSheetsClient");
 const auth = require("../middleware/auth");
 const { parser } = require("../cloudinary");
+const { formatIST } = require("../utils/date");
 
 const router = express.Router();
 const SHEET_NAME = "HelpTicketsMaster";
@@ -11,26 +12,6 @@ const generateTicketID = () => {
   const random4Digit = Math.floor(1000 + Math.random() * 9000);
   return `HT${random4Digit}`;
 };
-
-
-// ======================================================
-// DATE FORMATTER → dd/mm/yyyy hh:mm:ss (IST)
-// ======================================================
-function formatDateDDMMYYYYHHMMSS(date = new Date()) {
-  // Convert to IST (UTC + 5:30)
-  const utc = date.getTime() + date.getTimezoneOffset() * 60000;
-  const istOffset = 5.5 * 60 * 60 * 1000;
-  const istDate = new Date(utc + istOffset);
-
-  const dd = String(istDate.getDate()).padStart(2, "0");
-  const mm = String(istDate.getMonth() + 1).padStart(2, "0");
-  const yyyy = istDate.getFullYear();
-  const hh = String(istDate.getHours()).padStart(2, "0");
-  const min = String(istDate.getMinutes()).padStart(2, "0");
-  const ss = String(istDate.getSeconds()).padStart(2, "0");
-
-  return `${dd}/${mm}/${yyyy} ${hh}:${min}:${ss}`;
-}
 
 /* ================= CREATE TICKET ================= */
 router.post("/create", auth, parser.single("IssuePhoto"), async (req, res) => {
@@ -67,7 +48,7 @@ router.post("/create", auth, parser.single("IssuePhoto"), async (req, res) => {
     const ticketID = `#${String(nextIdNumber).padStart(5, '0')}`;
     // ========================================================
 
-    const createdDate = formatDateDDMMYYYYHHMMSS();
+    const createdDate = formatIST();
     const status = "Pending";
     const photoUrl = req.file ? req.file.path : "";
 
@@ -354,7 +335,7 @@ router.patch("/status/:ticketID", auth, async (req, res) => {
 
     const ticket = rows[index];
     ticket[4] = Status;
-    ticket[6] = Status === "Done" ? formatDateDDMMYYYYHHMMSS() : ""; // IST DoneDate
+    ticket[6] = Status === "Done" ? formatIST() : ""; // IST DoneDate
 
     await sheets.spreadsheets.values.update({
       spreadsheetId: process.env.GOOGLE_SHEET_ID_HELPTICKET,

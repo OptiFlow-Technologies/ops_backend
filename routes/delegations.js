@@ -2,33 +2,21 @@ const express = require("express");
 const { nanoid } = require("nanoid");
 const { getSheets } = require("../googleSheetsClient");
 const auth = require("../middleware/auth");
+const { formatIST, parseDDMMYYYYFull: parseDate } = require("../utils/date");
+const { DELEGATION: C } = require("../utils/columns");
 
 const router = express.Router();
 const SHEET_NAME = "DelegationMaster";
 
-// ======================================================
-// DATE FORMATTER → dd/mm/yyyy hh:mm:ss (IST)
-// ======================================================
-function formatDateDDMMYYYYHHMMSS(date = new Date()) {
-  // Convert to IST (UTC + 5:30)
-  const utc = date.getTime() + date.getTimezoneOffset() * 60000;
-  const istOffset = 5.5 * 60 * 60 * 1000;
-  const istDate = new Date(utc + istOffset);
-
-  const dd = String(istDate.getDate()).padStart(2, "0");
-  const mm = String(istDate.getMonth() + 1).padStart(2, "0");
-  const yyyy = istDate.getFullYear();
-  const hh = String(istDate.getHours()).padStart(2, "0");
-  const min = String(istDate.getMinutes()).padStart(2, "0");
-  const ss = String(istDate.getSeconds()).padStart(2, "0");
-
-  return `${dd}/${mm}/${yyyy} ${hh}:${min}:${ss}`;
+// B3 — Cache the numeric sheetId for DelegationMaster (permanent; never changes)
+let _sheetTabId = null;
+async function getSheetTabId(sheets) {
+  if (_sheetTabId !== null) return _sheetTabId;
+  const meta = await sheets.spreadsheets.get({ spreadsheetId: process.env.GOOGLE_SHEET_ID_DELEGATION });
+  const tab = meta.data.sheets.find(s => s.properties.title === SHEET_NAME);
+  _sheetTabId = tab?.properties?.sheetId ?? 0;
+  return _sheetTabId;
 }
-
-// Helper function to safely access a cell in the sheet
-const getCellValue = (row, index, defaultValue = "") => {
-  return row[index] || defaultValue;
-};
 
 // ======================================================
 // GET TASKS FOR LOGGED-IN USER
@@ -43,21 +31,21 @@ router.get("/", auth, async (req, res) => {
 
     const rows = fetch.data.values || [];
     const tasks = rows
-      .filter((r) => r[1] === req.user.name)
+      .filter((r) => r[C.NAME] === req.user.name)
       .map((r) => ({
-        TaskID: r[0],
-        Name: r[1],
-        TaskName: r[2],
-        CreatedDate: r[3],
-        Deadline: r[4],
-        Revision1: r[5],
-        Revision2: r[6],
-        FinalDate: r[7],
-        Revisions: parseInt(r[8]) || 0,
-        Priority: r[9],
-        Status: r[10] || "Pending",
-        Followup: r[11] || "",
-        Taskcompletedapproval: r[13] || "Pending",
+        TaskID: r[C.TASK_ID],
+        Name: r[C.NAME],
+        TaskName: r[C.TASK_NAME],
+        CreatedDate: r[C.CREATED_DATE],
+        Deadline: r[C.DEADLINE],
+        Revision1: r[C.REVISION1],
+        Revision2: r[C.REVISION2],
+        FinalDate: r[C.FINAL_DATE],
+        Revisions: parseInt(r[C.REVISION_COUNT]) || 0,
+        Priority: r[C.PRIORITY],
+        Status: r[C.STATUS] || "Pending",
+        Followup: r[C.ASSIGN_BY] || "",
+        Taskcompletedapproval: r[C.APPROVAL] || "Pending",
       }));
 
     res.json(tasks);
@@ -78,7 +66,7 @@ router.post("/", auth, async (req, res) => {
 //   return res.status(400).json({ error: "Please select Doer Name and Assign By before creating the task." });
 // }
 
-    const CreatedDate = formatDateDDMMYYYYHHMMSS();
+    const CreatedDate = formatIST();
 
     const sheets = await getSheets();
     const spreadsheetId = process.env.GOOGLE_SHEET_ID_DELEGATION;
@@ -138,28 +126,6 @@ router.post("/", auth, async (req, res) => {
 //========================================================
 // filter task details
 
-// Helper function to parse dates in 'dd/mm/yyyy' or 'dd/mm/yyyy hh:mm:ss' format
-const parseDate = (dateString) => {
-  if (!dateString) return null;
-
-  const parts = dateString.split(" ");
-  const dateParts = parts[0].split("/"); // Split dd/mm/yyyy
-  const timeParts = parts[1] ? parts[1].split(":") : [0, 0, 0]; // If time is available, split hh:mm:ss
-
-  // Ensure valid date format
-  if (dateParts.length !== 3) return null;
-
-  const day = parseInt(dateParts[0], 10);
-  const month = parseInt(dateParts[1], 10) - 1; // Months are 0-indexed
-  const year = parseInt(dateParts[2], 10);
-  const hours = parseInt(timeParts[0], 10);
-  const minutes = parseInt(timeParts[1], 10);
-  const seconds = parseInt(timeParts[2], 10);
-
-  // Create and return the Date object
-  const parsedDate = new Date(year, month, day, hours, minutes, seconds);
-  return isNaN(parsedDate) ? null : parsedDate;
-};
 
 
 // Function to get the start date of a week given the week number and the selected month
@@ -591,8 +557,6 @@ router.get("/filter", auth, async (req, res) => {
     if (!month || !week) {
       return res.status(400).json({ error: "Month and Week are required" });
     }
-console.log("selectedName:", selectedName);
-
 
     // -----------------------------
     // FETCH DATA FROM GOOGLE SHEET
@@ -610,7 +574,7 @@ console.log("selectedName:", selectedName);
     // -----------------------------
    const nameToFilter = selectedName && selectedName.trim() ? selectedName.trim() : req.user.name.trim();
 
-let filteredTasks = rows.filter((r) => r[1]?.trim() === nameToFilter);
+let filteredTasks = rows.filter((r) => r[C.NAME]?.trim() === nameToFilter);
 
 
     // -----------------------------
@@ -651,12 +615,10 @@ let filteredTasks = rows.filter((r) => r[1]?.trim() === nameToFilter);
     // FILTER TASKS BY CALCULATED RANGE
     // -----------------------------
     filteredTasks = filteredTasks.filter((task) => {
-      const createdDate = parseDate(task[3]);
-      const completedDate = task[7] ? parseDate(task[7]) : null;
-      
-      if (!createdDate) return false;
+      const createdDate = parseDate(task[C.CREATED_DATE]);
+      const completedDate = task[C.FINAL_DATE] ? parseDate(task[C.FINAL_DATE]) : null;
 
-      // Task active filter logic
+      if (!createdDate) return false;
       return createdDate <= weekEnd && (!completedDate || completedDate >= weekStart);
     });
 
@@ -669,21 +631,15 @@ let filteredTasks = rows.filter((r) => r[1]?.trim() === nameToFilter);
     let onTimeCount = 0;
     let delayedCount = 0;
 
-    console.log("deligation Week Start : ", weekStart , "weekend : ", weekEnd);
-    
 
     filteredTasks.forEach((task) => {
-      const completedDate = task[7] ? parseDate(task[7]) : null;
-      const deadlineDate = parseDate(task[4]);
+      const completedDate = task[C.FINAL_DATE] ? parseDate(task[C.FINAL_DATE]) : null;
+      const deadlineDate = parseDate(task[C.DEADLINE]);
 
-      // Count if completed within the selected range (Week or Full Month)
       if (completedDate && completedDate >= weekStart && completedDate <= weekEnd) {
         completedTaskCount++;
-        if (deadlineDate && completedDate <= deadlineDate) {
-          onTimeCount++;
-        } else {
-          delayedCount++;
-        }
+        if (deadlineDate && completedDate <= deadlineDate) onTimeCount++;
+        else delayedCount++;
       } else {
         pendingTaskCount++;
       }
@@ -712,19 +668,19 @@ let filteredTasks = rows.filter((r) => r[1]?.trim() === nameToFilter);
       weekStart: weekStart.toLocaleDateString('en-CA'), 
       weekEnd: weekEnd.toLocaleDateString('en-CA'),
       tasks: filteredTasks.map((r) => ({
-        TaskID: r[0],
-        Name: r[1],
-        TaskName: r[2],
-        CreatedDate: r[3],
-        Deadline: r[4],
-        Revision1: r[5],
-        Revision2: r[6],
-        FinalDate: r[7],
-        Revisions: parseInt(r[8]) || 0,
-        Priority: r[9],
-        Status: r[7] ? "Completed" : "Pending",
-        Followup: r[11] || "",
-        Taskcompletedapproval: r[13] || "Pending",
+        TaskID: r[C.TASK_ID],
+        Name: r[C.NAME],
+        TaskName: r[C.TASK_NAME],
+        CreatedDate: r[C.CREATED_DATE],
+        Deadline: r[C.DEADLINE],
+        Revision1: r[C.REVISION1],
+        Revision2: r[C.REVISION2],
+        FinalDate: r[C.FINAL_DATE],
+        Revisions: parseInt(r[C.REVISION_COUNT]) || 0,
+        Priority: r[C.PRIORITY],
+        Status: r[C.FINAL_DATE] ? "Completed" : "Pending",
+        Followup: r[C.ASSIGN_BY] || "",
+        Taskcompletedapproval: r[C.APPROVAL] || "Pending",
       })),
     };
 
@@ -776,14 +732,14 @@ router.put("/update/:id", auth, async (req, res) => {
     });
 
     const rows = fetch.data.values || [];
-    const idx = rows.findIndex((r) => r[0] === taskId);
+    const idx = rows.findIndex((r) => r[C.TASK_ID] === taskId);
     if (idx === -1) return res.status(404).json({ error: "Task not found" });
 
-    rows[idx][2] = TaskName || rows[idx][2];
-    rows[idx][4] = Deadline || rows[idx][4];
-    rows[idx][9] = Priority || rows[idx][9];
-    rows[idx][10] = Status || rows[idx][10];
-    rows[idx][11] = Notes || rows[idx][11];
+    rows[idx][C.TASK_NAME] = TaskName || rows[idx][C.TASK_NAME];
+    rows[idx][C.DEADLINE]  = Deadline || rows[idx][C.DEADLINE];
+    rows[idx][C.PRIORITY]  = Priority || rows[idx][C.PRIORITY];
+    rows[idx][C.STATUS]    = Status   || rows[idx][C.STATUS];
+    rows[idx][C.ASSIGN_BY] = Notes    || rows[idx][C.ASSIGN_BY];
 
     await sheets.spreadsheets.values.update({
       spreadsheetId: process.env.GOOGLE_SHEET_ID_DELEGATION,
@@ -799,31 +755,44 @@ router.put("/update/:id", auth, async (req, res) => {
 });
 
 // ======================================================
-// DELETE TASK
+// DELETE TASK — B3: uses deleteDimension (atomic, no race condition)
 // ======================================================
 router.delete("/delete/:id", auth, async (req, res) => {
   try {
     const taskId = req.params.id;
-
     const sheets = await getSheets();
-    const fetch = await sheets.spreadsheets.values.get({
-      spreadsheetId: process.env.GOOGLE_SHEET_ID_DELEGATION,
-      range: `${SHEET_NAME}!A2:R`,
+    const spreadsheetId = process.env.GOOGLE_SHEET_ID_DELEGATION;
+
+    // Only fetch column A to locate the row — no full read needed
+    const fetchRes = await sheets.spreadsheets.values.get({
+      spreadsheetId,
+      range: `${SHEET_NAME}!A2:A`,
     });
 
-    const rows = fetch.data.values || [];
-    const idx = rows.findIndex((r) => r[0] === taskId);
+    const ids = (fetchRes.data.values || []).map(r => r[0]);
+    const idx = ids.findIndex(id => id === taskId);
     if (idx === -1) return res.status(404).json({ error: "Task not found" });
 
-    rows.splice(idx, 1);
-    await sheets.spreadsheets.values.update({
-      spreadsheetId: process.env.GOOGLE_SHEET_ID_DELEGATION,
-      range: `${SHEET_NAME}!A2:R`,
-      valueInputOption: "USER_ENTERED",
-      requestBody: { values: rows },
+    const sheetTabId = await getSheetTabId(sheets);
+
+    // Single atomic delete — no read-modify-write rewrite
+    await sheets.spreadsheets.batchUpdate({
+      spreadsheetId,
+      requestBody: {
+        requests: [{
+          deleteDimension: {
+            range: {
+              sheetId: sheetTabId,
+              dimension: "ROWS",
+              startIndex: idx + 1, // +1: row 0 = header row
+              endIndex: idx + 2,
+            },
+          },
+        }],
+      },
     });
 
-    res.json({ ok: true, message: "Task deleted successfully" });
+    res.json({ ok: true, message: "Task deleted" });
   } catch (err) {
     res.status(500).json({ error: err.message });
   }
@@ -875,7 +844,7 @@ router.patch("/done/:id", auth, async (req, res) => {
 
     const rows = fetch.data.values || [];
     const idx = rows.findIndex(
-      (r) => r[0] === taskId && r[1] === req.user.name
+      (r) => r[C.TASK_ID] === taskId && r[C.NAME] === req.user.name
     );
 
     if (idx === -1)
@@ -883,20 +852,15 @@ router.patch("/done/:id", auth, async (req, res) => {
 
     // 2️⃣ Prepare dates
     const completedDate = new Date();
-    const day = completedDate.getDay(); // 0=Sunday
+    const day = completedDate.getDay();
     const diff = completedDate.getDate() - day + (day === 0 ? -6 : 1);
     const mondayDate = new Date(completedDate);
     mondayDate.setDate(diff);
 
-    const pad = (n) => String(n).padStart(2, "0");
-    const format = (d) =>
-      `${pad(d.getDate())}/${pad(d.getMonth() + 1)}/${d.getFullYear()} ` +
-      `${pad(d.getHours())}:${pad(d.getMinutes())}:${pad(d.getSeconds())}`;
-
-    // 3️⃣ Update row values
-    rows[idx][7] = format(completedDate); // Completed date
-    rows[idx][12] = format(mondayDate);   // Week Monday
-    rows[idx][10] = "Completed";          // Status
+    // 3️⃣ Update row values using named constants
+    rows[idx][C.FINAL_DATE]     = formatIST(completedDate);
+    rows[idx][C.WEEK_MONDAY]    = formatIST(mondayDate);
+    rows[idx][C.STATUS]         = "Completed";
 
     // 4️⃣ Retry function for writing
     const writeWithRetry = async (retry = 3) => {
@@ -942,13 +906,12 @@ router.patch("/shift/:id", auth, async (req, res) => {
     });
 
     const rows = fetch.data.values || [];
-    const idx = rows.findIndex((r) => r[0] === taskId && r[1] === req.user.name);
+    const idx = rows.findIndex((r) => r[C.TASK_ID] === taskId && r[C.NAME] === req.user.name);
     if (idx === -1) return res.status(404).json({ error: "Task not found" });
-console.log("newDeadline: ", newDeadline);
 
-    rows[idx][4] = newDeadline;
-    rows[idx][8] = (parseInt(rows[idx][8]) || 0) + 1;
-    rows[idx][10] = "Shifted";
+    rows[idx][C.DEADLINE]       = newDeadline;
+    rows[idx][C.REVISION_COUNT] = (parseInt(rows[idx][C.REVISION_COUNT]) || 0) + 1;
+    rows[idx][C.STATUS]         = "Shifted";
 
     await sheets.spreadsheets.values.update({
       spreadsheetId: process.env.GOOGLE_SHEET_ID_DELEGATION,
@@ -979,51 +942,35 @@ router.get("/search/by-name", auth, async (req, res) => {
 
     let rows = fetch.data.values || [];
 
-    // ✅ NEW: AssignBy filter (optional)
     if (assignBy && assignBy.toLowerCase() !== "all") {
       rows = rows.filter(
-        (r) => r[11]?.toLowerCase() === assignBy.toLowerCase()
+        (r) => r[C.ASSIGN_BY]?.toLowerCase() === assignBy.toLowerCase()
       );
     }
 
-    // ✅ EXISTING BEHAVIOUR — untouched
+    const mapRow = (r) => ({
+      TaskID: r[C.TASK_ID],
+      Name: r[C.NAME],
+      TaskName: r[C.TASK_NAME],
+      CreatedDate: r[C.CREATED_DATE],
+      Deadline: r[C.DEADLINE],
+      Revision1: r[C.REVISION1],
+      Revision2: r[C.REVISION2],
+      FinalDate: r[C.FINAL_DATE],
+      Revisions: r[C.REVISION_COUNT],
+      Priority: r[C.PRIORITY],
+      Status: r[C.STATUS],
+      Followup: r[C.ASSIGN_BY],
+      Taskcompletedapproval: r[C.APPROVAL] || "Pending",
+    });
+
     if (name.toLowerCase() === "all") {
-      return res.json(
-        rows.map((r) => ({
-          TaskID: r[0],
-          Name: r[1],
-          TaskName: r[2],
-          CreatedDate: r[3],
-          Deadline: r[4],
-          Revision1: r[5],
-          Revision2: r[6],
-          FinalDate: r[7],
-          Revisions: r[8],
-          Priority: r[9],
-          Status: r[10],
-          Followup: r[11],
-          Taskcompletedapproval: r[13] || "Pending",
-        }))
-      );
+      return res.json(rows.map(mapRow));
     }
 
     const tasks = rows
-      .filter((r) => r[1]?.toLowerCase() === name.toLowerCase())
-      .map((r) => ({
-        TaskID: r[0],
-        Name: r[1],
-        TaskName: r[2],
-        CreatedDate: r[3],
-        Deadline: r[4],
-        Revision1: r[5],
-        Revision2: r[6],
-        FinalDate: r[7],
-        Revisions: r[8],
-        Priority: r[9],
-        Status: r[10],
-        Followup: r[11],
-        Taskcompletedapproval: r[13] || "Pending",
-      }));
+      .filter((r) => r[C.NAME]?.toLowerCase() === name.toLowerCase())
+      .map(mapRow);
 
     res.json(tasks);
   } catch (err) {
@@ -1052,22 +999,19 @@ router.patch("/approve/:id", auth, async (req, res) => {
     });
 
     const rows = fetch.data.values || [];
-    const idx = rows.findIndex((r) => r[0] === taskId);
+    const idx = rows.findIndex((r) => r[C.TASK_ID] === taskId);
     if (idx === -1) return res.status(404).json({ error: "Task not found" });
 
-    // Ensure row has at least 14 columns
     while (rows[idx].length < 14) rows[idx].push("");
 
-    // 2️⃣ Update row based on approvalStatus
     if (approvalStatus === "Approved") {
-      rows[idx][13] = "Approved";   // Approval status
-      rows[idx][10] = "Completed";  // Task status
-      // rows[idx][7] = formatDateDDMMYYYYHHMMSS(); // Optional: completion date
+      rows[idx][C.APPROVAL] = "Approved";
+      rows[idx][C.STATUS]   = "Completed";
     } else {
-      rows[idx][13] = "Pending";
-      rows[idx][7] = "";            // Clear completion date
-      rows[idx][12] = "";           // Clear week Monday
-      rows[idx][10] = "Pending";    // Reset task status
+      rows[idx][C.APPROVAL]     = "Pending";
+      rows[idx][C.FINAL_DATE]   = "";
+      rows[idx][C.WEEK_MONDAY]  = "";
+      rows[idx][C.STATUS]       = "Pending";
     }
 
     // 3️⃣ Retry function for writing

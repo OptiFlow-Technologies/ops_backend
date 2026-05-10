@@ -2,18 +2,14 @@ const express = require("express");
 const router = express.Router();
 const auth = require("../middleware/auth");
 const { getSheets } = require("../googleSheetsClient");
+const { parseDDMMYYYY } = require("../utils/date");
+const { DELEGATION: D, CHECKLIST: CH, TICKET: T } = require("../utils/columns");
+const cache = require("../utils/cache");
+
+const EMPLOYEE_CACHE_KEY = "employees";
+const EMPLOYEE_CACHE_TTL = 5 * 60 * 1000; // 5 minutes
 
 /* ===================== HELPERS ===================== */
-
-function parseDDMMYYYY(str) {
-  if (!str) return null;
-  const p = str.split(" ")[0].split("/");
-  if (p.length !== 3) return null;
-  const [d, m, y] = p;
-  const year = y.length === 2 ? 2000 + +y : +y;
-  const date = new Date(year, +m - 1, +d);
-  return isNaN(date.getTime()) ? null : date;
-}
 
 function percent(part, total) {
   return total ? ((part / total) * 100).toFixed(2) : "0.00";
@@ -53,23 +49,21 @@ function getWeekRange(month, week) {
 
 /* ===================== CALCULATORS ===================== */
 
-// Delegation Calculation
 function delegationCalc(rows, name, weekStart, weekEnd) {
   const empName = name.trim().toLowerCase();
   let total = 0, completed = 0, pending = 0, onTime = 0, delayed = 0;
 
   rows.forEach(r => {
-    if ((r[1]?.trim().toLowerCase() || "") !== empName) return;
+    if ((r[D.NAME]?.trim().toLowerCase() || "") !== empName) return;
 
-    const created = parseDDMMYYYY(r[3]);
-    const deadline = parseDDMMYYYY(r[4]);
-    const done = r[7] ? parseDDMMYYYY(r[7]) : null;
+    const created = parseDDMMYYYY(r[D.CREATED_DATE]);
+    const deadline = parseDDMMYYYY(r[D.DEADLINE]);
+    const done = r[D.FINAL_DATE] ? parseDDMMYYYY(r[D.FINAL_DATE]) : null;
 
     if (!created) return;
     if (!(created <= weekEnd && (!done || done >= weekStart))) return;
 
     total++;
-
     if (done && done >= weekStart && done <= weekEnd) {
       completed++;
       if (deadline && done <= deadline) onTime++;
@@ -89,25 +83,23 @@ function delegationCalc(rows, name, weekStart, weekEnd) {
   };
 }
 
-// Checklist Calculation
 function checklistCalc(rows, name, weekStart, weekEnd) {
   const empName = name.trim().toLowerCase();
   let total = 0, completed = 0, pending = 0, onTime = 0, delayed = 0;
 
   rows.forEach(r => {
-    if ((r[0]?.trim().toLowerCase() || "") !== empName) return;
+    if ((r[CH.NAME]?.trim().toLowerCase() || "") !== empName) return;
 
-    const planned = parseDDMMYYYY(r[6]);
-    const actual = parseDDMMYYYY(r[7]);
+    const planned = parseDDMMYYYY(r[CH.PLANNED]);
+    const actual  = parseDDMMYYYY(r[CH.ACTUAL]);
 
     const inRange =
       (planned && planned >= weekStart && planned <= weekEnd) ||
-      (actual && actual >= weekStart && actual <= weekEnd);
+      (actual  && actual  >= weekStart && actual  <= weekEnd);
 
     if (!inRange) return;
 
     total++;
-
     if (actual) {
       completed++;
       if (planned && actual <= planned) onTime++;
@@ -127,22 +119,19 @@ function checklistCalc(rows, name, weekStart, weekEnd) {
   };
 }
 
-// Ticket Calculation (HelpTicket and SupportTicket)
 function ticketCalc(rows, name, weekStart, weekEnd) {
   const empName = name.trim().toLowerCase();
   let total = 0, completed = 0, pending = 0, onTime = 0, delayed = 0;
 
   rows.forEach(r => {
-    if ((r[2]?.trim().toLowerCase() || "") !== empName) return;
+    if ((r[T.ASSIGNED_TO]?.trim().toLowerCase() || "") !== empName) return;
 
-    const created = parseDDMMYYYY(r[5]);
-    const done = parseDDMMYYYY(r[6]);
+    const created = parseDDMMYYYY(r[T.CREATED_DATE]);
+    const done    = parseDDMMYYYY(r[T.DONE_DATE]);
     if (!created) return;
-
     if (!(created <= weekEnd && (!done || done >= weekStart))) return;
 
     total++;
-
     if (done && done >= weekStart && done <= weekEnd) {
       completed++;
       const days = Math.ceil((done - created) / (1000 * 60 * 60 * 24));
@@ -168,16 +157,14 @@ function ticketCalcCreated(rows, name, weekStart, weekEnd) {
   let total = 0, completed = 0, pending = 0, onTime = 0, delayed = 0;
 
   rows.forEach(r => {
-    if ((r[1]?.trim().toLowerCase() || "") !== empName) return;
+    if ((r[T.CREATED_BY]?.trim().toLowerCase() || "") !== empName) return;
 
-    const created = parseDDMMYYYY(r[5]);
-    const done = parseDDMMYYYY(r[6]);
+    const created = parseDDMMYYYY(r[T.CREATED_DATE]);
+    const done    = parseDDMMYYYY(r[T.DONE_DATE]);
     if (!created) return;
-
     if (!(created <= weekEnd && (!done || done >= weekStart))) return;
 
     total++;
-
     if (done && done >= weekStart && done <= weekEnd) {
       completed++;
       const days = Math.ceil((done - created) / (1000 * 60 * 60 * 24));
@@ -210,126 +197,102 @@ router.get("/all-dashboard", auth, async (req, res) => {
     const sheets = await getSheets();
     const { weekStart, weekEnd } = getWeekRange(month, week);
 
-    // EMPLOYEES
-    const empRes = await sheets.spreadsheets.values.get({
-      spreadsheetId: process.env.GOOGLE_SHEET_ID,
-      range: "Employee!A2:H",
-    });
+    // P1 — employee list from cache; fall back to Sheets fetch if stale/missing
+    let employees = cache.get(EMPLOYEE_CACHE_KEY);
+    let empFetchPromise = null;
 
-    let employees = (empRes.data.values || []).map(e => ({
-      name: e[1]?.trim(),
-      key: e[1]?.trim().toLowerCase(),
-    }));
-
-    // FILTER EMPLOYEE IF selectedName PROVIDED
-    if (selectedName && selectedName !== "all") {
-      employees = employees.filter(e => e.key === selectedName.trim().toLowerCase());
+    if (!employees) {
+      empFetchPromise = sheets.spreadsheets.values.get({
+        spreadsheetId: process.env.GOOGLE_SHEET_ID,
+        range: "Employee!A2:L",
+      });
     }
 
-    // ALL DATA
-    const delegationRows = (await sheets.spreadsheets.values.get({
-      spreadsheetId: process.env.GOOGLE_SHEET_ID_DELEGATION,
-      range: "DelegationMaster!A2:R",
-    })).data.values || [];
+    // P2 — fetch all data sheets concurrently (not sequentially)
+    const [delegationRes, checklistRes, helpRes, supportRes, empResIfNeeded] = await Promise.all([
+      sheets.spreadsheets.values.get({
+        spreadsheetId: process.env.GOOGLE_SHEET_ID_DELEGATION,
+        range: "DelegationMaster!A2:R",
+      }),
+      sheets.spreadsheets.values.get({
+        spreadsheetId: process.env.GOOGLE_SHEET_ID_CHECKLIST,
+        range: "Master!A2:K",
+      }),
+      sheets.spreadsheets.values.get({
+        spreadsheetId: process.env.GOOGLE_SHEET_ID_HELPTICKET,
+        range: "HelpTicketsMaster!A2:H",
+      }),
+      sheets.spreadsheets.values.get({
+        spreadsheetId: process.env.GOOGLE_SHEET_ID_SUPPORTTICKET,
+        range: "SupportTicketsMaster!A2:H",
+      }),
+      empFetchPromise || Promise.resolve(null),
+    ]);
 
-    const checklistRows = (await sheets.spreadsheets.values.get({
-      spreadsheetId: process.env.GOOGLE_SHEET_ID_CHECKLIST,
-      range: "Master!A2:K",
-    })).data.values || [];
+    if (empResIfNeeded) {
+      employees = (empResIfNeeded.data.values || []).map(e => ({
+        name: e[1]?.trim(),
+        key: e[1]?.trim().toLowerCase(),
+      }));
+      cache.set(EMPLOYEE_CACHE_KEY, employees, EMPLOYEE_CACHE_TTL);
+    }
 
-    const helpRows = (await sheets.spreadsheets.values.get({
-      spreadsheetId: process.env.GOOGLE_SHEET_ID_HELPTICKET,
-      range: "HelpTicketsMaster!A2:H",
-    })).data.values || [];
+    const delegationRows = delegationRes.data.values || [];
+    const checklistRows  = checklistRes.data.values  || [];
+    const helpRows       = helpRes.data.values        || [];
+    const supportRows    = supportRes.data.values     || [];
 
-    const supportRows = (await sheets.spreadsheets.values.get({
-      spreadsheetId: process.env.GOOGLE_SHEET_ID_SUPPORTTICKET,
-      range: "SupportTicketsMaster!A2:H",
-    })).data.values || [];
+    let filteredEmployees = employees;
+    if (selectedName && selectedName !== "all") {
+      filteredEmployees = employees.filter(e => e.key === selectedName.trim().toLowerCase());
+    }
 
-    const data = [];
-
-    for (const emp of employees) {
+    const data = filteredEmployees.map(emp => {
       const nameKey = emp.key;
 
-      const delegation = delegationCalc(delegationRows, nameKey, weekStart, weekEnd);
-      const checklist = checklistCalc(checklistRows, nameKey, weekStart, weekEnd);
-      const helpTicket = ticketCalc(helpRows, nameKey, weekStart, weekEnd);
-      const supportTicket = ticketCalc(supportRows, nameKey, weekStart, weekEnd);
-const helpTicketCrated = ticketCalcCreated(helpRows, nameKey, weekStart, weekEnd);
-      const supportTicketCreated = ticketCalcCreated(supportRows, nameKey, weekStart, weekEnd);
+      const delegation    = delegationCalc(delegationRows,  nameKey, weekStart, weekEnd);
+      const checklist     = checklistCalc(checklistRows,    nameKey, weekStart, weekEnd);
+      const helpAssigned  = ticketCalc(helpRows,            nameKey, weekStart, weekEnd);
+      const helpCreated   = ticketCalcCreated(helpRows,     nameKey, weekStart, weekEnd);
+      const suppAssigned  = ticketCalc(supportRows,         nameKey, weekStart, weekEnd);
+      const suppCreated   = ticketCalcCreated(supportRows,  nameKey, weekStart, weekEnd);
 
       const totalWork =
-        delegation.totalWork +
-        checklist.totalWork +
-        helpTicket.totalWork +
-        supportTicket.totalWork;
+        delegation.totalWork + checklist.totalWork +
+        helpAssigned.totalWork + suppAssigned.totalWork;
 
       const totalCompleted =
-        delegation.completedWork +
-        checklist.completedWork +
-        helpTicket.completedWork +
-        supportTicket.completedWork;
+        delegation.completedWork + checklist.completedWork +
+        helpAssigned.completedWork + suppAssigned.completedWork;
 
       const totalPending =
-        delegation.pendingWork +
-        checklist.pendingWork +
-        helpTicket.pendingWork +
-        supportTicket.pendingWork;
+        delegation.pendingWork + checklist.pendingWork +
+        helpAssigned.pendingWork + suppAssigned.pendingWork;
 
       const totalOnTime =
-        delegation.onTimeWork +
-        checklist.onTimeWork +
-        helpTicket.onTimeWork +
-        supportTicket.onTimeWork;
+        delegation.onTimeWork + checklist.onTimeWork +
+        helpAssigned.onTimeWork + suppAssigned.onTimeWork;
 
       const pendingPercent = percent(totalPending, totalWork);
 
-      const delayPercent =
-        (Number(delegation.delayPercent) +
-         Number(checklist.delayPercent) +
-         Number(helpTicket.delayPercent) +
-         Number(supportTicket.delayPercent)) / 4;
+      const delayPercent = (
+        Number(delegation.delayPercent) +
+        Number(checklist.delayPercent) +
+        Number(helpAssigned.delayPercent) +
+        Number(suppAssigned.delayPercent)
+      ) / 4;
 
-      data.push({
+      return {
         name: emp.name,
         delegation,
         checklist,
         helpTicket: {
-          assigned: {
-            totalWork: helpTicket.totalWork,
-            completedWork: helpTicket.completedWork,
-            pendingWork: helpTicket.pendingWork,
-            onTimeWork: helpTicket.onTimeWork,
-            pendingPercent: helpTicket.pendingPercent,
-            delayPercent: helpTicket.delayPercent,
-          },
-          created: {
-            totalWork: helpTicketCrated.totalWork,
-            completedWork: helpTicketCrated.completedWork,
-            pendingWork: helpTicketCrated.pendingWork,
-            onTimeWork: helpTicketCrated.onTimeWork,
-            pendingPercent: helpTicketCrated.pendingPercent,
-            delayPercent: helpTicketCrated.delayPercent,
-          },
+          assigned: helpAssigned,
+          created:  helpCreated,
         },
         supportTicket: {
-          assigned: {
-            totalWork: supportTicket.totalWork,
-            completedWork: supportTicket.completedWork,
-            pendingWork: supportTicket.pendingWork,
-            onTimeWork: supportTicket.onTimeWork,
-            pendingPercent: supportTicket.pendingPercent,
-            delayPercent: supportTicket.delayPercent,
-          },
-          created: {
-            totalWork: supportTicketCreated.totalWork,
-            completedWork: supportTicketCreated.completedWork,
-            pendingWork: supportTicketCreated.pendingWork,
-            onTimeWork: supportTicketCreated.onTimeWork,
-            pendingPercent: supportTicketCreated.pendingPercent,
-            delayPercent: supportTicketCreated.delayPercent,
-          },
+          assigned: suppAssigned,
+          created:  suppCreated,
         },
         overall: {
           totalWork,
@@ -340,12 +303,12 @@ const helpTicketCrated = ticketCalcCreated(helpRows, nameKey, weekStart, weekEnd
           delayPercent: delayPercent.toFixed(2),
           overallScore: calculate80_20(pendingPercent, delayPercent),
         },
-      });
-    }
+      };
+    });
 
     res.json({
       weekStart: weekStart.toLocaleDateString("en-CA"),
-      weekEnd: weekEnd.toLocaleDateString("en-CA"),
+      weekEnd:   weekEnd.toLocaleDateString("en-CA"),
       data,
     });
   } catch (err) {

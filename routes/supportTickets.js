@@ -2,27 +2,10 @@ const express = require("express");
 const { getSheets } = require("../googleSheetsClient");
 const auth = require("../middleware/auth");
 const { parser } = require("../cloudinary");
+const { formatIST } = require("../utils/date");
 
 const router = express.Router();
 const SHEET_NAME = "SupportTicketsMaster";
-
-// ======================================================
-// DATE FORMATTER → dd/mm/yyyy hh:mm:ss (IST)
-// ======================================================
-function formatDateDDMMYYYYHHMMSS(date = new Date()) {
-  const utc = date.getTime() + date.getTimezoneOffset() * 60000;
-  const istOffset = 5.5 * 60 * 60 * 1000;
-  const istDate = new Date(utc + istOffset);
-
-  const dd = String(istDate.getDate()).padStart(2, "0");
-  const mm = String(istDate.getMonth() + 1).padStart(2, "0");
-  const yyyy = istDate.getFullYear();
-  const hh = String(istDate.getHours()).padStart(2, "0");
-  const min = String(istDate.getMinutes()).padStart(2, "0");
-  const ss = String(istDate.getSeconds()).padStart(2, "0");
-
-  return `${dd}/${mm}/${yyyy} ${hh}:${min}:${ss}`;
-}
 
 /* ================= TEST ROUTES ================= */
 router.get("/test", (req, res) => {
@@ -46,7 +29,7 @@ router.post("/create", auth, parser.single("IssuePhoto"), async (req, res) => {
     }
 
     const sheets = await getSheets();
-    const createdDate = formatDateDDMMYYYYHHMMSS();
+    const createdDate = formatIST();
     const photoUrl = req.file ? req.file.path : "";
 
     // Get all employees
@@ -328,7 +311,7 @@ router.patch("/status/:ticketID", auth, async (req, res) => {
         if (workBy && workBy !== req.user.name) {
           return res.status(403).json({ error: "You can only complete tickets you started" });
         }
-        doneDate = formatDateDDMMYYYYHHMMSS();
+        doneDate = formatIST();
         taskApproval = "Pending";
         console.log("MIS Completing ticket");
       }
